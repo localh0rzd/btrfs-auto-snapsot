@@ -1,0 +1,590 @@
+#!/bin/bash
+#
+# btrfs-auto-snapshot -- automatic, rotating btrfs snapshots.
+#
+# Modeled on zfs-auto-snapshot (https://github.com/zfsonlinux/zfs-auto-snapshot):
+# same command-line interface, same snapshot naming and the same
+# frequent/hourly/daily/weekly/monthly scheme.
+#
+# Snapshots of SUBVOL are written to SUBVOL/<snapdir>/ (default ".btrfs-auto-snapshot")
+# and are read-only by default. Btrfs snapshots are not recursive, so the
+# snapshot directory (itself a subvolume) is never included in later snapshots.
+#
+# Per-subvolume opt-in/opt-out uses extended attributes on the subvolume root,
+# the btrfs equivalent of the ZFS "com.sun:auto-snapshot" property:
+#
+#   setfattr -n user.auto-snapshot        -v false /home     # skip all labels
+#   setfattr -n user.auto-snapshot:hourly -v false /home     # skip only hourly
+#
+# This is free software; you may redistribute it under the GPL v2 or later.
+
+set -o pipefail
+shopt -s nullglob
+
+PROG=${0##*/}
+VERSION=1.0.0
+
+# Defaults (match zfs-auto-snapshot where it makes sense).
+opt_debug=0
+opt_dry_run=0
+opt_default_exclude=0
+opt_destroy_only=0
+opt_event='-'
+opt_keep=''
+opt_label=''
+opt_prefix='btrfs-auto-snap'
+opt_sep='_'
+opt_quiet=0
+opt_syslog=0
+opt_recursive=0
+opt_verbose=0
+opt_utc=0
+opt_writable=0
+opt_snapdir='.btrfs-auto-snapshot'
+opt_snaproot=''
+opt_pre_snapshot=''
+opt_post_snapshot=''
+opt_lockfile='/run/lock/btrfs-auto-snapshot.lock'
+
+XATTR='user.auto-snapshot'
+
+# Default retention when --keep is not given, keyed by label.
+default_keep() {
+	case $1 in
+		frequent) echo 4 ;;
+		hourly)   echo 24 ;;
+		daily)    echo 31 ;;
+		weekly)   echo 8 ;;
+		monthly)  echo 12 ;;
+		*)        echo '' ;;   # keep everything
+	esac
+}
+
+usage() {
+	cat <<EOF
+Usage: $PROG [options] [-l label] <'//' | subvolume> [subvolume...]
+
+  -d, --debug            Print debugging messages.
+  -e, --event=EVENT      Set the event name logged to syslog.
+  -h, --help             Print this usage message.
+  -k, --keep=NUM         Keep NUM recent snapshots and destroy older ones
+                         (default: frequent=4 hourly=24 daily=31 weekly=8
+                          monthly=12; other labels keep everything).
+  -l, --label=LAB        LAB is usually 'hourly', 'daily', or 'monthly'.
+  -p, --prefix=PRE       PRE is 'btrfs-auto-snap' by default.
+  -q, --quiet            Suppress warnings and notices at the console.
+      --sep=CHAR         Use CHAR to separate date stamps in snapshot names.
+  -g, --syslog           Write messages into the system log.
+  -r, --recursive        Snapshot named subvolumes and all nested subvolumes.
+  -v, --verbose          Print info messages.
+  -n, --dry-run          Print actions without actually doing anything.
+  -u, --utc              Use UTC for snapshot names.
+  -s, --snapdir=DIR      Snapshot directory, relative to each subvolume
+                         (default: .btrfs-auto-snapshot).
+  -S, --snaproot=ROOT    Keep snapshots in ROOT/<subvolume path> instead of
+                         inside each subvolume. An absolute ROOT is an existing
+                         directory on the same filesystem. A relative ROOT
+                         (e.g. '@snapshots') lives at the top level of each
+                         filesystem; the top level is mounted privately while
+                         the script runs, so the snapshots stay out of view.
+  -w, --writable         Create writable snapshots (default: read-only).
+      --default-exclude  Only snapshot subvolumes with $XATTR=true.
+      --destroy-only     Only destroy older snapshots, do not create new ones.
+      --pre-snapshot=CMD Command to run before each snapshot ("CMD SUBVOL SNAPNAME").
+      --post-snapshot=CMD
+                         Command to run after each snapshot ("CMD SUBVOL SNAPNAME").
+      --lockfile=FILE    Serialize runs with flock on FILE
+                         (default: $opt_lockfile).
+  -V, --version          Print version and exit.
+
+  subvolume              A path to a btrfs subvolume.
+  //                     Every mounted btrfs subvolume (honours $XATTR).
+EOF
+}
+
+# --- logging ----------------------------------------------------------------
+
+log() {   # log LEVEL MESSAGE...
+	local level=$1; shift
+	if [ "$opt_syslog" -eq 1 ]; then
+		logger -t "$PROG" -p "daemon.$level" -- "$opt_event: $*" 2>/dev/null
+	fi
+}
+
+print_debug() {
+	[ "$opt_debug" -eq 1 ] && echo "Debug: $*" >&2
+	log debug "$*"
+	return 0
+}
+print_info() {
+	[ "$opt_verbose" -eq 1 ] && echo "$*"
+	log info "$*"
+	return 0
+}
+print_notice() {
+	[ "$opt_quiet" -eq 0 ] && echo "$*"
+	log notice "$*"
+	return 0
+}
+print_warning() {
+	[ "$opt_quiet" -eq 0 ] && echo "Warning: $*" >&2
+	log warning "$*"
+	return 0
+}
+print_error() {
+	echo "Error: $*" >&2
+	log err "$*"
+}
+die() {
+	print_error "$*"
+	exit 1
+}
+
+# Run a command, or just print it in dry-run mode.
+do_run() {
+	if [ "$opt_dry_run" -eq 1 ]; then
+		echo "$*"
+		return 0
+	fi
+	print_debug "running: $*"
+	"$@"
+}
+
+# --- btrfs helpers ----------------------------------------------------------
+
+# True if PATH is the root of a btrfs subvolume (inode 256 on btrfs).
+is_subvolume() {
+	[ -d "$1" ] || return 1
+	[ "$(stat -f -c %T -- "$1" 2>/dev/null)" = btrfs ] || return 1
+	[ "$(stat -c %i -- "$1" 2>/dev/null)" = 256 ]
+}
+
+# Print the value of xattr NAME on PATH, or nothing.
+get_xattr() {
+	command -v getfattr >/dev/null 2>&1 || return 0
+	getfattr --only-values --absolute-names -n "$2" -- "$1" 2>/dev/null
+}
+
+# Decide whether SUBVOL should be snapshotted for the current label,
+# following zfs-auto-snapshot's property semantics.
+wants_snapshot() {
+	local subvol=$1 value
+	value=$(get_xattr "$subvol" "$XATTR:$opt_label")
+	[ -z "$value" ] && value=$(get_xattr "$subvol" "$XATTR")
+	case $value in
+		true)  return 0 ;;
+		false) return 1 ;;
+		*)     [ "$opt_default_exclude" -eq 0 ] ;;
+	esac
+}
+
+# All mounted btrfs filesystems/subvolumes, one path per line.
+mounted_subvolumes() {
+	findmnt -rn -t btrfs -o TARGET | while IFS= read -r target; do
+		# findmnt -r escapes whitespace as \x20 etc.
+		printf '%b\n' "$target"
+	done
+}
+
+# Nested subvolumes below PATH (not crossing into non-btrfs mounts and not
+# descending into snapshot directories).
+nested_subvolumes() {
+	# find(1) reports nested subvolumes as fstype "unknown", so prune
+	# non-btrfs mount points by path instead of using -fstype.
+	local root=${1%/} target fstype prune=()
+	while read -r target fstype; do
+		target=$(printf '%b' "$target")
+		[ "$fstype" = btrfs ] && continue
+		case $target in "$root"/*) prune+=(-o -path "$target") ;; esac
+	done < <(findmnt -rn -o TARGET,FSTYPE)
+	[ "$snaproot_mode" = absolute ] && prune+=(-o -path "$opt_snaproot")
+	find "$root/" -mindepth 1 \
+		\( -name "$opt_snapdir" -o -name .snapshots "${prune[@]}" \) -prune \
+		-o -type d -inum 256 -print 2>/dev/null | sed 's|//*|/|g'
+}
+
+# Identify a subvolume uniquely (filesystem UUID + subvolume id) so that the
+# same subvolume mounted twice is only snapshotted once.
+subvol_key() {
+	# btrfs derives statfs f_fsid from the filesystem UUID and the subvolume
+	# id, so it is unique per subvolume.
+	stat -f -c %i -- "$1" 2>/dev/null || readlink -f -- "$1"
+}
+
+# Locate PATH inside its btrfs filesystem. Sets loc_uuid (filesystem UUID)
+# and loc_path (path relative to the top-level subvolume, no leading slash,
+# empty for the top level itself). Works without root.
+locate_path() {
+	local p target fsroot uuid rel
+	p=$(readlink -f -- "$1") || return 1
+	read -r target fsroot uuid < <(findmnt -rn -o TARGET,FSROOT,UUID -T "$p" | head -n1)
+	[ -n "$uuid" ] || return 1
+	target=$(printf '%b' "$target")
+	fsroot=$(printf '%b' "$fsroot")
+	if [ "$target" = / ]; then rel=$p; else rel=${p#"$target"}; fi
+	loc_uuid=$uuid
+	loc_path=${fsroot%/}$rel
+	loc_path=${loc_path#/}
+	loc_path=${loc_path%/}
+	return 0
+}
+
+# True if PATH (fs-relative, as from locate_path) is ROOT or below it.
+path_within() {
+	[ -z "$2" ] || [ "$1" = "$2" ] || [[ $1 == "$2"/* ]]
+}
+
+# Mount the top level of filesystem UUID privately; sets top_mnt.
+declare -A top_mounts=()
+top_mnt_base=''
+mount_top_level() {
+	local uuid=$1
+	if [ -n "${top_mounts[$uuid]:-}" ]; then
+		top_mnt=${top_mounts[$uuid]}
+		return 0
+	fi
+	if [ -z "$top_mnt_base" ]; then
+		top_mnt_base=$(mktemp -d /run/btrfs-auto-snapshot.XXXXXX) ||
+			{ print_warning "cannot create a temporary mount directory"; return 1; }
+		trap cleanup_mounts EXIT
+	fi
+	top_mnt="$top_mnt_base/$uuid"
+	mkdir -p -- "$top_mnt" || return 1
+	print_debug "mounting top level of $uuid on $top_mnt"
+	if ! mount -t btrfs -o subvolid=5 "UUID=$uuid" "$top_mnt"; then
+		print_warning "cannot mount the top level of filesystem $uuid"
+		rmdir -- "$top_mnt" 2>/dev/null
+		return 1
+	fi
+	top_mounts[$uuid]=$top_mnt
+	return 0
+}
+
+cleanup_mounts() {
+	local m
+	for m in "${top_mounts[@]}"; do
+		umount -- "$m" 2>/dev/null || umount -l -- "$m" 2>/dev/null
+		rmdir -- "$m" 2>/dev/null
+	done
+	[ -n "$top_mnt_base" ] && rmdir -- "$top_mnt_base" 2>/dev/null
+	return 0
+}
+
+# Work out where snapshots of SUBVOL go. Sets snapdir and snapdir_kind
+# ("subvol": create as a subvolume, "dir": create with mkdir -p).
+resolve_snapdir() {
+	local subvol=$1 name
+	if [ -z "$opt_snaproot" ]; then
+		snapdir="${subvol%/}/$opt_snapdir"
+		snapdir_kind=subvol
+		return 0
+	fi
+	locate_path "$subvol" || { print_warning "cannot locate $subvol"; return 1; }
+	name=${loc_path:-.top-level}
+	if [ "$snaproot_mode" = absolute ]; then
+		if [ "$loc_uuid" != "$snaproot_uuid" ]; then
+			print_warning "$subvol is on a different filesystem than $opt_snaproot, skipping"
+			return 1
+		fi
+		snapdir="${opt_snaproot%/}/$name"
+		snapdir_kind=dir
+		return 0
+	fi
+	mount_top_level "$loc_uuid" || return 1
+	local root="$top_mnt/$opt_snaproot"
+	if [ ! -d "$root" ]; then
+		print_info "Creating snapshot root $opt_snaproot on filesystem $loc_uuid"
+		if [ "$opt_dry_run" -eq 0 ]; then
+			mkdir -p -- "$(dirname -- "$root")" &&
+				btrfs -q subvolume create -- "$root" >/dev/null &&
+				chmod 0700 -- "$root" ||
+				{ print_warning "cannot create $opt_snaproot on $loc_uuid"; return 1; }
+		fi
+	fi
+	snapdir="$root/$name"
+	snapdir_kind=dir
+	return 0
+}
+
+# True if SUBVOL is one of our snapshot roots or inside one.
+in_snaproot() {
+	[ -n "$opt_snaproot" ] || return 1
+	locate_path "$1" || return 1
+	if [ "$snaproot_mode" = absolute ]; then
+		[ "$loc_uuid" = "$snaproot_uuid" ] && path_within "$loc_path" "$snaproot_path"
+	else
+		path_within "$loc_path" "$opt_snaproot"
+	fi
+}
+
+# True if SUBVOL holds an active swap file (btrfs refuses to snapshot it).
+has_active_swapfile() {
+	local key file type
+	key=$(subvol_key "$1")
+	while read -r file type _; do
+		[ "$type" = file ] || continue
+		file=$(printf '%b' "$file")
+		[ "$(subvol_key "$(dirname -- "$file")")" = "$key" ] && return 0
+	done < <(tail -n +2 /proc/swaps 2>/dev/null)
+	return 1
+}
+
+# --- snapshot management ----------------------------------------------------
+
+# List existing snapshot names of the current label in SNAPDIR, newest first.
+list_snapshots() {
+	local snapdir=$1 entry name
+	local re="^${prefix_re}${sep_re}${label_re}-[0-9]{4}-[0-9]{2}-[0-9]{2}-[0-9]{4}$"
+	for entry in "$snapdir"/*; do
+		name=${entry##*/}
+		[[ $name =~ $re ]] || continue
+		is_subvolume "$entry" || continue
+		echo "$name"
+	done | sort -r
+}
+
+destroy_old() {
+	local subvol=$1 snapdir=$2 keep=$3 name i=0 rc=0
+	[ -n "$keep" ] || return 0
+	[ -d "$snapdir" ] || return 0
+	while IFS= read -r name; do
+		i=$((i + 1))
+		[ "$i" -le "$keep" ] && continue
+		print_info "Destroying $snapdir/$name"
+		if ! do_run btrfs -q subvolume delete -- "$snapdir/$name"; then
+			print_warning "failed to destroy $snapdir/$name"
+			rc=1
+		fi
+	done < <(list_snapshots "$snapdir")
+	return $rc
+}
+
+take_snapshot() {
+	local subvol=$1 snapdir=$2 snapname=$3
+	local ro_flag=(-r)
+	[ "$opt_writable" -eq 1 ] && ro_flag=()
+
+	if [ ! -e "$snapdir" ] && [ "$snapdir_kind" = dir ]; then
+		do_run mkdir -p -m 0700 -- "$snapdir" ||
+			{ print_warning "cannot create $snapdir"; return 1; }
+	elif [ ! -e "$snapdir" ]; then
+		# The snapshot directory is a subvolume so that it is never part of
+		# a snapshot of its parent.
+		do_run btrfs -q subvolume create -- "$snapdir" ||
+			{ print_warning "cannot create $snapdir"; return 1; }
+		do_run chmod 0700 -- "$snapdir"
+	elif [ ! -d "$snapdir" ]; then
+		print_warning "$snapdir exists and is not a directory, skipping $subvol"
+		return 1
+	fi
+
+	if [ -e "$snapdir/$snapname" ]; then
+		print_warning "$snapdir/$snapname already exists, skipping"
+		return 1
+	fi
+
+	if [ -n "$opt_pre_snapshot" ]; then
+		print_debug "pre-snapshot: $opt_pre_snapshot $subvol $snapname"
+		if ! do_run $opt_pre_snapshot "$subvol" "$snapname"; then
+			print_warning "pre-snapshot command failed for $subvol, skipping"
+			return 1
+		fi
+	fi
+
+	print_info "Snapshotting $subvol -> $snapdir/$snapname"
+	if ! do_run btrfs -q subvolume snapshot "${ro_flag[@]}" -- "$subvol" "$snapdir/$snapname"; then
+		print_warning "failed to snapshot $subvol"
+		return 1
+	fi
+
+	if [ -n "$opt_post_snapshot" ]; then
+		print_debug "post-snapshot: $opt_post_snapshot $subvol $snapname"
+		do_run $opt_post_snapshot "$subvol" "$snapname" ||
+			print_warning "post-snapshot command failed for $subvol"
+	fi
+	return 0
+}
+
+# Escape a string for use in an extended regex.
+re_escape() {
+	printf '%s' "$1" | sed 's/[][\.*^$+?(){}|/]/\\&/g'
+}
+
+# --- argument parsing -------------------------------------------------------
+
+orig_args=("$@")
+args=$(getopt -n "$PROG" \
+	-o de:hk:l:p:qgrvnus:S:wV \
+	--long debug,event:,help,keep:,label:,prefix:,quiet,sep:,syslog,recursive,verbose,dry-run,utc,snapdir:,snaproot:,writable,default-exclude,destroy-only,pre-snapshot:,post-snapshot:,lockfile:,version \
+	-- "$@") || { usage >&2; exit 2; }
+eval set -- "$args"
+
+while true; do
+	case $1 in
+		-d|--debug)        opt_debug=1; opt_verbose=1; opt_quiet=0 ;;
+		-e|--event)        opt_event=$2; shift ;;
+		-h|--help)         usage; exit 0 ;;
+		-k|--keep)         opt_keep=$2; shift ;;
+		-l|--label)        opt_label=$2; shift ;;
+		-p|--prefix)       opt_prefix=$2; shift ;;
+		-q|--quiet)        opt_quiet=1; opt_verbose=0; opt_debug=0 ;;
+		--sep)             opt_sep=$2; shift ;;
+		-g|--syslog)       opt_syslog=1 ;;
+		-r|--recursive)    opt_recursive=1 ;;
+		-v|--verbose)      opt_verbose=1; opt_quiet=0 ;;
+		-n|--dry-run)      opt_dry_run=1 ;;
+		-u|--utc)          opt_utc=1 ;;
+		-s|--snapdir)      opt_snapdir=$2; shift ;;
+		-S|--snaproot)     opt_snaproot=$2; shift ;;
+		-w|--writable)     opt_writable=1 ;;
+		--default-exclude) opt_default_exclude=1 ;;
+		--destroy-only)    opt_destroy_only=1 ;;
+		--pre-snapshot)    opt_pre_snapshot=$2; shift ;;
+		--post-snapshot)   opt_post_snapshot=$2; shift ;;
+		--lockfile)        opt_lockfile=$2; shift ;;
+		-V|--version)      echo "$PROG $VERSION"; exit 0 ;;
+		--)                shift; break ;;
+	esac
+	shift
+done
+
+[ $# -gt 0 ] || { usage >&2; exit 2; }
+
+[ -n "$opt_label" ] || opt_label=regular
+[ -n "$opt_keep" ] || opt_keep=$(default_keep "$opt_label")
+if [ -n "$opt_keep" ] && ! [[ $opt_keep =~ ^[1-9][0-9]*$ ]]; then
+	die "--keep must be a positive integer, got '$opt_keep'"
+fi
+[[ $opt_label =~ ^[A-Za-z0-9._-]+$ ]]  || die "invalid label '$opt_label'"
+[[ $opt_prefix =~ ^[A-Za-z0-9._-]+$ ]] || die "invalid prefix '$opt_prefix'"
+[[ $opt_sep =~ ^[A-Za-z0-9._:-]$ ]]    || die "--sep must be a single safe character"
+[[ $opt_snapdir != */* && $opt_snapdir != . && $opt_snapdir != .. && -n $opt_snapdir ]] ||
+	die "--snapdir must be a plain directory name"
+
+prefix_re=$(re_escape "$opt_prefix")
+sep_re=$(re_escape "$opt_sep")
+label_re=$(re_escape "$opt_label")
+
+command -v btrfs >/dev/null 2>&1 || die "btrfs command not found"
+
+snaproot_mode=''
+if [ -n "$opt_snaproot" ]; then
+	if [[ $opt_snaproot == /* ]]; then
+		snaproot_mode=absolute
+		[ -d "$opt_snaproot" ] || die "--snaproot $opt_snaproot does not exist"
+		opt_snaproot=$(readlink -f -- "$opt_snaproot")
+		[ "$(stat -f -c %T -- "$opt_snaproot")" = btrfs ] ||
+			die "--snaproot $opt_snaproot is not on btrfs"
+		locate_path "$opt_snaproot" || die "cannot locate $opt_snaproot"
+		snaproot_uuid=$loc_uuid
+		snaproot_path=$loc_path
+	else
+		snaproot_mode=relative
+		opt_snaproot=${opt_snaproot%/}
+		[[ /$opt_snaproot/ != */../* && /$opt_snaproot/ != */./* && $opt_snaproot != */ && -n $opt_snaproot ]] ||
+			die "invalid --snaproot '$opt_snaproot'"
+		[ "$(id -u)" -eq 0 ] || die "a relative --snaproot needs root (it mounts the top level)"
+		# Mount the top level in a private mount namespace, so nobody else
+		# ever sees it and it disappears even if the script is killed.
+		if [ -z "${BTRFS_AUTO_SNAPSHOT_NS:-}" ] && command -v unshare >/dev/null 2>&1; then
+			BTRFS_AUTO_SNAPSHOT_NS=1 exec unshare -m --propagation private -- "$BASH" "$0" "${orig_args[@]}"
+		fi
+	fi
+fi
+if [ "$opt_dry_run" -eq 0 ] && [ "$(id -u)" -ne 0 ]; then
+	print_warning "not running as root; snapshot deletion may fail"
+fi
+if ! command -v getfattr >/dev/null 2>&1; then
+	print_debug "getfattr not found; $XATTR attributes are ignored"
+	[ "$opt_default_exclude" -eq 1 ] &&
+		die "--default-exclude needs getfattr (package 'attr') to read $XATTR"
+fi
+
+# --- serialize concurrent runs ----------------------------------------------
+
+if [ "$opt_dry_run" -eq 0 ] && [ -n "$opt_lockfile" ] && command -v flock >/dev/null 2>&1; then
+	if { exec 9>>"$opt_lockfile"; } 2>/dev/null; then
+		flock -w 600 9 || die "timed out waiting for lock $opt_lockfile"
+	else
+		print_debug "cannot open lock file $opt_lockfile, continuing unlocked"
+	fi
+fi
+
+# --- build the list of subvolumes -------------------------------------------
+
+candidates=()
+explicit=1
+for arg in "$@"; do
+	if [ "$arg" = // ]; then
+		explicit=0
+		while IFS= read -r p; do candidates+=("$p"); done < <(mounted_subvolumes)
+	else
+		p=$(readlink -f -- "$arg") || die "$arg: no such file or directory"
+		is_subvolume "$p" || die "$arg is not a btrfs subvolume"
+		candidates+=("$p")
+	fi
+done
+
+if [ "$opt_recursive" -eq 1 ]; then
+	base=("${candidates[@]}")
+	for p in "${base[@]}"; do
+		while IFS= read -r q; do candidates+=("$q"); done < <(nested_subvolumes "$p")
+	done
+fi
+
+declare -A seen=()
+targets=()
+for p in "${candidates[@]}"; do
+	# Never snapshot our own snapshot directories or their contents.
+	case "/$p/" in */"$opt_snapdir"/*) continue ;; esac
+	is_subvolume "$p" || continue
+	if in_snaproot "$p"; then
+		print_debug "skipping $p: inside the snapshot root"
+		continue
+	fi
+	key=$(subvol_key "$p")
+	[ -n "${seen[$key]:-}" ] && continue
+	seen[$key]=1
+	if ! wants_snapshot "$p"; then
+		print_debug "excluded by $XATTR: $p"
+		continue
+	fi
+	if has_active_swapfile "$p"; then
+		print_info "skipping $p: contains an active swap file"
+		continue
+	fi
+	targets+=("$p")
+done
+
+if [ ${#targets[@]} -eq 0 ]; then
+	print_notice "No subvolumes selected for snapshot."
+	exit 0
+fi
+
+# --- do the work ------------------------------------------------------------
+
+if [ "$opt_utc" -eq 1 ]; then
+	stamp=$(date -u +%F-%H%M)
+else
+	stamp=$(date +%F-%H%M)
+fi
+snapname="${opt_prefix}${opt_sep}${opt_label}-${stamp}"
+
+print_debug "label=$opt_label keep=${opt_keep:-all} snapname=$snapname"
+
+errors=0
+for subvol in "${targets[@]}"; do
+	resolve_snapdir "$subvol" || { errors=$((errors + 1)); continue; }
+	if [ "$opt_destroy_only" -eq 0 ]; then
+		take_snapshot "$subvol" "$snapdir" "$snapname" || errors=$((errors + 1))
+	fi
+	destroy_old "$subvol" "$snapdir" "$opt_keep" || errors=$((errors + 1))
+done
+
+if [ "$opt_destroy_only" -eq 1 ]; then
+	print_notice "@$snapname: destroy-only run on ${#targets[@]} subvolume(s), $errors error(s)."
+else
+	print_notice "@$snapname, ${#targets[@]} subvolume(s), $errors error(s)."
+fi
+
+[ "$errors" -eq 0 ]

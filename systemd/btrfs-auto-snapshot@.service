@@ -1,0 +1,10 @@
+[Unit]
+Description=btrfs-auto-snapshot (%i)
+Documentation=file:///usr/local/share/doc/btrfs-auto-snapshot/README.md
+
+[Service]
+Type=oneshot
+EnvironmentFile=-/etc/default/btrfs-auto-snapshot
+ExecStart=/usr/local/sbin/btrfs-auto-snapshot --quiet --syslog --label=%i $BTRFS_AUTO_SNAPSHOT_OPTS $BTRFS_AUTO_SNAPSHOT_TARGETS
+Nice=10
+IOSchedulingClass=idle

@@ -1,0 +1,10 @@
+[Unit]
+Description=btrfs-auto-snapshot frequent timer
+
+[Timer]
+OnCalendar=*:00/15
+Persistent=true
+Unit=btrfs-auto-snapshot@frequent.service
+
+[Install]
+WantedBy=timers.target

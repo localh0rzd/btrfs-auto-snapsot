@@ -1,0 +1,10 @@
+[Unit]
+Description=btrfs-auto-snapshot monthly timer
+
+[Timer]
+OnCalendar=monthly
+Persistent=true
+Unit=btrfs-auto-snapshot@monthly.service
+
+[Install]
+WantedBy=timers.target

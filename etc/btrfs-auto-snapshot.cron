@@ -1,0 +1,9 @@
+# /etc/cron.d/btrfs-auto-snapshot -- alternative to the systemd timers.
+# Install either this file or the timers, not both.
+PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+
+*/15 * * * * root btrfs-auto-snapshot --quiet --syslog --label=frequent --keep=4  //
+7    * * * * root btrfs-auto-snapshot --quiet --syslog --label=hourly   --keep=24 //
+25   0 * * * root btrfs-auto-snapshot --quiet --syslog --label=daily    --keep=31 //
+47   0 * * 0 root btrfs-auto-snapshot --quiet --syslog --label=weekly   --keep=8  //
+52   0 1 * * root btrfs-auto-snapshot --quiet --syslog --label=monthly  --keep=12 //

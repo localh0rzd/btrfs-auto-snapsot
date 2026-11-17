@@ -1,0 +1,10 @@
+# /etc/default/btrfs-auto-snapshot -- read by the systemd units.
+
+# Subvolumes to snapshot. "//" means every mounted btrfs subvolume
+# (opt out per subvolume with: setfattr -n user.auto-snapshot -v false PATH).
+BTRFS_AUTO_SNAPSHOT_TARGETS="//"
+
+# Extra options, e.g. "--utc" or "--default-exclude" or "--snapdir=.snapshots-auto".
+# "--snaproot=@snapshots" keeps snapshots in a top-level subvolume that is
+# only mounted (privately) while the script runs, so they stay out of view.
+BTRFS_AUTO_SNAPSHOT_OPTS=""

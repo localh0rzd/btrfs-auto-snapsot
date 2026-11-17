@@ -1,0 +1,10 @@
+[Unit]
+Description=btrfs-auto-snapshot weekly timer
+
+[Timer]
+OnCalendar=weekly
+Persistent=true
+Unit=btrfs-auto-snapshot@weekly.service
+
+[Install]
+WantedBy=timers.target
