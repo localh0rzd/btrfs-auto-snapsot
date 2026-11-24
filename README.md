@@ -119,6 +119,64 @@ or the cron file, not both.
 The targets and extra options for the timers are set in
 `/etc/default/btrfs-auto-snapshot` (default target: `//`).
 
+## Uninstall
+
+```bash
+sudo make uninstall
+```
+
+```bash
+sudo systemctl daemon-reload
+```
+
+This stops and disables the timers, then removes the script, the docs, the
+systemd units and the cron file. If you installed with a custom `PREFIX` or
+`UNITDIR`, pass the same values to `make uninstall`.
+
+The config file and the snapshots are left in place. To remove the config file:
+
+```bash
+sudo rm /etc/default/btrfs-auto-snapshot
+```
+
+Snapshots are read-only subvolumes, so `rm -rf` can't remove them. Delete them
+with `btrfs subvolume delete`. With the default layout, run this for each
+subvolume that was snapshotted (by default, every mounted btrfs subvolume, as
+listed by `findmnt -t btrfs`):
+
+```bash
+sudo btrfs subvolume delete /home/.btrfs-auto-snapshot/btrfs-auto-snap_*
+```
+
+```bash
+sudo btrfs subvolume delete /home/.btrfs-auto-snapshot
+```
+
+With a relative `--snaproot`, mount the filesystem top level and delete the
+snapshot root:
+
+```bash
+sudo mount -o subvolid=5 /dev/mapper/cryptroot /mnt
+```
+
+```bash
+sudo find /mnt/@snapshots -name 'btrfs-auto-snap_*' -prune -exec btrfs subvolume delete {} +
+```
+
+```bash
+sudo btrfs subvolume delete /mnt/@snapshots
+```
+
+```bash
+sudo umount /mnt
+```
+
+With an absolute `--snaproot`, run the same `find` command on that directory.
+Afterwards, the empty directory can be removed with `rm -r`.
+
+If you used `--prefix`, `--snapdir` or another snapshot root, change the names
+in these commands to match.
+
 ## Options
 
 | option | meaning |
